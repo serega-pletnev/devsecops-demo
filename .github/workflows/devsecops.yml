@@ -159,6 +159,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Create net
         run: docker network create net || true
+      - name: Build image (for DAST)
+        run: docker build -t app:demo .
       - name: Run app
         run: |
           docker rm -f app || true
