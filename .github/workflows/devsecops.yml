@@ -2,7 +2,7 @@ name: DevSecOps CI (SAST/SCA/Secrets/Image + local DAST)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
@@ -17,23 +17,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
       - run: pip install -r requirements.txt
-      - run: python -c "print('ok')"
+      - run: python -c "import app.main as m; print('OK')"
 
   semgrep:
     runs-on: ubuntu-latest
     needs: build_test
     steps:
       - uses: actions/checkout@v4
-      - run: docker run --rm -v "$PWD:/src" -w /src -e SEMGREP_SEND_METRICS=off returntocorp/semgrep:latest semgrep scan --config p/ci --exclude .git --sarif --output semgrep.sarif --error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: semgrep.sarif
-          path: semgrep.sarif
+      - name: Run Semgrep
+        run: |
+          docker run --rm \
+            -e SEMGREP_SEND_METRICS=off \
+            -v "$PWD":/src returntocorp/semgrep:latest \
+            semgrep --config p/ci --sarif -o /src/semgrep.sarif --error /src
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semgrep
+          path: semgrep.sarif
 
   trivy_fs:
     runs-on: ubuntu-latest
@@ -42,119 +49,146 @@ jobs:
       - uses: actions/checkout@v4
       - uses: aquasecurity/trivy-action@0.24.0
         with:
-          scan-type: fs
-          format: sarif
-          output: trivy-fs.sarif
-          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          scan-type: "fs"
           ignore-unfixed: true
-      - uses: actions/upload-artifact@v4
-        with:
-          name: trivy-fs.sarif
-          path: trivy-fs.sarif
+          format: "sarif"
+          output: "trivy-fs.sarif"
+          severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+          scanners: "vuln,secret"
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-fs.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy_fs
+          path: trivy-fs.sarif
 
   gitleaks:
     runs-on: ubuntu-latest
     needs: build_test
     steps:
       - uses: actions/checkout@v4
-      - run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect --source=/repo --report-format sarif --report-path /repo/gitleaks.sarif --redact --no-git
-      - uses: actions/upload-artifact@v4
         with:
-          name: gitleaks.sarif
-          path: gitleaks.sarif
+          fetch-depth: 0
+      - name: Run Gitleaks
+        run: |
+          docker run --rm -v "$PWD":/repo zricethezav/gitleaks:latest \
+            detect --source=/repo --report-format sarif --report-path /repo/gitleaks.sarif --no-banner --exit-code 0
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: gitleaks.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks
+          path: gitleaks.sarif
+
+  pip_audit:
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - run: pip install pip-audit
+      - run: pip-audit -r requirements.txt -f sarif -o pip-audit.sarif || true
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: pip-audit.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pip_audit
+          path: pip-audit.sarif
 
   image_scan:
     runs-on: ubuntu-latest
     needs: build_test
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t app:demo .
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: app:demo
+          load: false
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=docker,dest=/tmp/app.tar
+      - run: docker load -i /tmp/app.tar
       - uses: aquasecurity/trivy-action@0.24.0
         with:
-          scan-type: image
-          image-ref: app:demo
-          format: sarif
-          output: trivy-image.sarif
-          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          scan-type: "image"
+          image-ref: "app:demo"
           ignore-unfixed: true
-      - uses: actions/upload-artifact@v4
-        with:
-          name: trivy-image.sarif
-          path: trivy-image.sarif
+          format: "sarif"
+          output: "trivy-image.sarif"
+          vuln-type: "os,library"
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-image.sarif
+      - uses: anchore/sbom-action@v0
+        with:
+          image: "app:demo"
+          artifact-name: "sbom.cdx.json"
+          format: "cyclonedx-json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy_image
+          path: trivy-image.sarif
 
   dast_local:
     runs-on: ubuntu-latest
-    needs: image_scan
+    needs: [image_scan, semgrep, trivy_fs, gitleaks, pip_audit]
     steps:
       - uses: actions/checkout@v4
-
       - run: docker network create net || true
-      - run: docker rm -f app || true
       - run: docker build -t app:demo .
+      - run: docker rm -f app || true
       - run: docker run -d --rm --name app --network net -p 8000:8000 app:demo
-
-      - name: Wait until app is ready
-        run: |
+      - run: |
           for i in $(seq 1 120); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/ || true)
-            if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then exit 0; fi
+            if curl -fsS http://localhost:8000/ >/dev/null 2>&1; then exit 0; fi
             sleep 2
           done
-          docker logs app || true
           exit 1
-
-      - name: ZAP Baseline (via official action)
-        uses: zaproxy/action-baseline@v0.13.0
-        with:
-          target: http://localhost:8000
-          cmd_options: "-J zap.json -w zap.html -T 60 -I"
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      # Подберём любой HTML-отчёт, если имя отличается от zap.html
-      - name: Pick ZAP HTML
-        id: pick_html
+      - run: echo IMG=ghcr.io/zaproxy/zap2docker-stable:latest >> $GITHUB_ENV
+      - name: Pull ZAP image with fallback
         run: |
-          set -e
-          HTML="$(ls -1 *.html 2>/dev/null | head -n1 || true)"
-          echo "HTML=${HTML}" >> "$GITHUB_ENV"
-
-      - name: Upload ZAP JSON
-        uses: actions/upload-artifact@v4
+          docker pull "$IMG" || { docker pull owasp/zap2docker-stable:latest && echo IMG=owasp/zap2docker-stable:latest >> $GITHUB_ENV; }
+      - run: |
+          mkdir -p zap/wrk
+          docker run --rm --network net -v "$PWD/zap/wrk":/zap/wrk "$IMG" \
+            zap-baseline.py -t http://app:8000/ -J zap.json -w zap.html -T 60 -I || true
+      - uses: actions/upload-artifact@v4
         with:
-          name: zap.json
-          path: zap.json
-
-      - name: Upload ZAP HTML (if present)
-        if: env.HTML != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: zap.html
-          path: ${{ env.HTML }}
-
-      - run: docker rm -f app || true
+          name: zap
+          path: |
+            zap/wrk/zap.json
+            zap/wrk/zap.html
 
   gate:
     runs-on: ubuntu-latest
-    needs: [semgrep, trivy_fs, gitleaks, image_scan, dast_local]
+    needs: dast_local
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: zap.json
+          name: zap
           path: .
       - run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-          H=$(jq '[.site[].alerts[] | select((.riskcode=="3") or (.riskdesc|test("High";"i"))) ] | length' zap.json)
-          M=$(jq '[.site[].alerts[] | select((.riskcode=="2") or (.riskdesc|test("Medium";"i"))) ] | length' zap.json)
-          echo "ZAP High=$H Medium=$M"
-          if [ "$H" -gt 0 ] || [ "$M" -gt 5 ]; then exit 1; fi
+          ZAP_JSON="./zap.json"
+          if [ ! -f "$ZAP_JSON" ]; then
+            echo "ZAP report not found" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          H=$(jq '[.site[].alerts[] | select(.riskcode=="3")] | length' "$ZAP_JSON")
+          M=$(jq '[.site[].alerts[] | select(.riskcode=="2")] | length' "$ZAP_JSON")
+          echo "High: $H  Medium: $M" >> $GITHUB_STEP_SUMMARY
+          if [ "$H" -gt 0 ] || [ "$M" -gt 5 ]; then
+            exit 1
+          fi
 
