@@ -96,11 +96,14 @@ jobs:
     needs: image_scan
     steps:
       - uses: actions/checkout@v4
+
       - run: docker network create net || true
       - run: docker rm -f app || true
       - run: docker build -t app:demo .
       - run: docker run -d --rm --name app --network net -p 8000:8000 app:demo
-      - run: |
+
+      - name: Wait until app is ready
+        run: |
           for i in $(seq 1 120); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/ || true)
             if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then exit 0; fi
@@ -108,20 +111,35 @@ jobs:
           done
           docker logs app || true
           exit 1
-      - uses: zaproxy/action-baseline@v0.13.0
+
+      - name: ZAP Baseline (via official action)
+        uses: zaproxy/action-baseline@v0.13.0
         with:
           target: http://localhost:8000
           cmd_options: "-J zap.json -w zap.html -T 60 -I"
-          allow_issue_warnings: true
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/upload-artifact@v4
+
+      # Подберём любой HTML-отчёт, если имя отличается от zap.html
+      - name: Pick ZAP HTML
+        id: pick_html
+        run: |
+          set -e
+          HTML="$(ls -1 *.html 2>/dev/null | head -n1 || true)"
+          echo "HTML=${HTML}" >> "$GITHUB_ENV"
+
+      - name: Upload ZAP JSON
+        uses: actions/upload-artifact@v4
         with:
           name: zap.json
           path: zap.json
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload ZAP HTML (if present)
+        if: env.HTML != ''
+        uses: actions/upload-artifact@v4
         with:
           name: zap.html
-          path: zap.html
+          path: ${{ env.HTML }}
+
       - run: docker rm -f app || true
 
   gate:
