@@ -9,7 +9,7 @@ on:
 
 permissions:
   contents: read
-  security-events: write   # для загрузки SARIF в GitHub Security
+  security-events: write
   actions: read
 
 jobs:
@@ -44,7 +44,6 @@ jobs:
             -v "$PWD:/src" -w /src \
             returntocorp/semgrep:latest \
             semgrep ci --sarif --output semgrep.sarif || true
-          # подстилка на случай полностью пустого вывода
           [ -s semgrep.sarif ] || printf '%s' \
             '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"semgrep"}},"results":[]}]}'> semgrep.sarif
 
@@ -187,6 +186,10 @@ jobs:
       - name: Create net
         run: docker network create net || true
 
+      # ВАЖНО: собираем образ ЗДЕСЬ тоже, т.к. между job-ами он не сохраняется
+      - name: Build image (for DAST)
+        run: docker build -t app:demo .
+
       - name: Run app container
         run: |
           docker rm -f app || true
@@ -226,13 +229,11 @@ jobs:
 
       - name: ZAP Baseline -> zap.json & zap.html
         run: |
-          # ВАЖНО: рабочая директория /zap/wrk (иначе файлы окажутся в корне контейнера)
           docker run --rm --network net \
             -v "$PWD:/zap/wrk" -w /zap/wrk "$IMG" \
             zap-baseline.py -t http://app:8000 \
               -J zap.json -w zap.html -T 60 -I || true
 
-          # подстилки, если ничего не сгенерировалось
           [ -f zap.json ] || printf '%s' \
             '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"ZAP Baseline"}},"results":[]}]}'> zap.json
           [ -f zap.html ] || echo '<html><body><h3>ZAP baseline produced no output</h3></body></html>' > zap.html
@@ -250,7 +251,7 @@ jobs:
           docker rm -f app || true
           docker network rm net || true
 
-  # ---------- Gate (простая заглушка; при желании можно усилить) ----------
+  # ---------- Gate ----------
   gate:
     needs: dast_local
     runs-on: ubuntu-latest
