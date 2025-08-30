@@ -186,27 +186,30 @@ jobs:
       - name: Create net
         run: docker network create net || true
 
-      # ВАЖНО: собираем образ ЗДЕСЬ тоже, т.к. между job-ами он не сохраняется
+      # пересобираем образ здесь, т.к. раннер другой
       - name: Build image (for DAST)
         run: docker build -t app:demo .
 
       - name: Run app container
         run: |
           docker rm -f app || true
+          # при желании можно пробросить порт на хост: -p 8000:8000
           docker run -d --rm --name app --network net app:demo
-          sleep 1
 
+      # <<< FIX: readiness из контейнера в той же сети >>>
       - name: Wait readiness (120s)
         run: |
           set -e
           for i in $(seq 1 120); do
-            if curl -fsS http://app:8000/ >/dev/null; then
+            if docker run --rm --network net curlimages/curl:8.8.0 \
+                 -fsS http://app:8000/ >/dev/null; then
               echo "App is ready"
               exit 0
             fi
             sleep 1
           done
           echo "App not ready in time" >&2
+          docker logs --tail 200 app || true
           exit 1
 
       - name: Resolve & pull ZAP image (GHCR ➜ GHCR-stable ➜ Hub-weekly ➜ Hub-stable)
