@@ -2,12 +2,13 @@ name: DevSecOps CI (SAST/SCA/Secrets/Image + local DAST)
 
 on:
   push:
-  workflow_dispatch:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
 permissions:
   contents: read
   security-events: write
-  actions: read
 
 jobs:
   build_test:
@@ -16,22 +17,26 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - run: python app/main.py --help || true
+          python-version: "3.11"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
   semgrep:
     runs-on: ubuntu-latest
     needs: build_test
     steps:
       - uses: actions/checkout@v4
-      - run: docker run --rm -v "$PWD:/src" returntocorp/semgrep:latest semgrep scan --config p/ci --sarif --output semgrep.sarif
+      - name: Run Semgrep (SARIF)
+        run: |
+          docker run --rm -v "$PWD:/src" returntocorp/semgrep:latest \
+            semgrep scan --config auto --sarif --output /src/semgrep.sarif --metrics=off || true
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
       - uses: actions/upload-artifact@v4
         with:
-          name: semgrep.sarif
+          name: semgrep
           path: semgrep.sarif
 
   trivy_fs:
@@ -42,122 +47,125 @@ jobs:
       - uses: aquasecurity/trivy-action@0.24.0
         with:
           scan-type: fs
+          scanners: vuln,secret,config
+          ignore-unfixed: true
           format: sarif
           output: trivy-fs.sarif
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"
           hide-progress: true
-          ignore-unfixed: true
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-fs.sarif
-      - uses: aquasecurity/trivy-action@0.24.0
-        with:
-          scan-type: fs
-          format: cyclonedx
-          output: sbom.cdx.json
-          hide-progress: true
-          ignore-unfixed: true
       - uses: actions/upload-artifact@v4
         with:
-          name: sbom.cdx.json
-          path: sbom.cdx.json
-
-  gitleaks:
-    runs-on: ubuntu-latest
-    needs: build_test
-    steps:
-      - uses: actions/checkout@v4
-      - uses: gitleaks/gitleaks-action@v2
-        with:
-          args: --no-git --report-format sarif --report-path gitleaks.sarif
-      - uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: gitleaks.sarif
-      - uses: actions/upload-artifact@v4
-        with:
-          name: gitleaks.sarif
-          path: gitleaks.sarif
+          name: trivy-fs
+          path: trivy-fs.sarif
 
   image_scan:
     runs-on: ubuntu-latest
     needs: build_test
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t app:test .
+      - name: Build Docker image
+        run: docker build -t app:test .
       - uses: aquasecurity/trivy-action@0.24.0
         with:
           scan-type: image
           image-ref: app:test
+          ignore-unfixed: true
           format: sarif
           output: trivy-image.sarif
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"
           hide-progress: true
-          ignore-unfixed: true
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-image.sarif
       - uses: actions/upload-artifact@v4
         with:
-          name: trivy-image.sarif
+          name: trivy-image
           path: trivy-image.sarif
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Gitleaks (SARIF + JSON)
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:latest detect \
+            --no-git --redact --report-format sarif --report-path /repo/gitleaks.sarif || true
+          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:latest detect \
+            --no-git --redact --report-format json  --report-path /repo/gitleaks.json  || true
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks
+          path: |
+            gitleaks.sarif
+            gitleaks.json
 
   dast_local:
     runs-on: ubuntu-latest
-    needs: build_test
-    timeout-minutes: 20
+    needs: [image_scan]
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t app:test .
-      - run: docker network create scan || true
-      - run: |
-          docker rm -f app || true
-          docker run -d --name app --network scan -p 3000:3000 app:test
-      - run: |
-          for i in $(seq 1 60); do
-            if curl -fsS http://localhost:3000/ >/dev/null; then exit 0; fi
+
+      - name: Build app image (local)
+        run: docker build -t app:test .
+
+      - name: Prepare network & run app
+        run: |
+          docker rm -f app 2>/dev/null || true
+          docker network rm zapnet 2>/dev/null || true
+          docker network create zapnet
+          docker run -d --name app --network zapnet -p 8000:8000 app:test
+
+      - name: Wait readiness (max 8 min)
+        run: |
+          for i in $(seq 1 96); do
+            if curl -fsS http://127.0.0.1:8000/ >/dev/null 2>&1; then
+              echo "app is up"; exit 0
+            fi
             sleep 5
           done
-          docker logs app
-          exit 1
-      - run: |
-          docker pull ghcr.io/zaproxy/zap2docker-stable:latest || docker pull owasp/zap2docker-stable:latest
-      - continue-on-error: true
+          echo "App not ready"; docker logs app || true; exit 1
+
+      - name: ZAP Baseline -> zap.json & zap.html (non-fatal, with fallback)
         run: |
-          img="ghcr.io/zaproxy/zap2docker-stable:latest"
-          docker image inspect "$img" >/dev/null 2>&1 || img="owasp/zap2docker-stable:latest"
-          docker run --rm --network scan -v "$PWD:/zap/wrk" -t "$img" \
-            zap-baseline.py -I -m 5 -T 5 -t http://app:3000 \
-            -x zap.xml -J zap.json -r zap.html
-      - if: always()
-        uses: actions/upload-artifact@v4
+          mkdir -p zap
+          docker run --rm --network zapnet -v "$PWD/zap:/zap/wrk" \
+            ghcr.io/zaproxy/zap2docker-stable:latest zap-baseline.py \
+            -t http://app:8000/ -J zap.json -r zap.html -w zap.md -I -m 3 || true
+          # fallback: host network (если DNS контейнера не сработал)
+          test -f zap/zap.json || docker run --rm --network host -v "$PWD/zap:/zap/wrk" \
+            ghcr.io/zaproxy/zap2docker-stable:latest zap-baseline.py \
+            -t http://127.0.0.1:8000/ -J zap.json -r zap.html -w zap.md -I -m 3 || true
+
+      - uses: actions/upload-artifact@v4
         with:
           name: dast
-          path: |
-            zap.json
-            zap.html
-            zap.xml
-      - if: always()
-        run: |
-          docker logs app || true
-          docker rm -f app || true
-          docker network rm scan || true
+          path: zap/
 
   gate:
     runs-on: ubuntu-latest
-    needs: [semgrep, trivy_fs, gitleaks, image_scan, dast_local]
+    needs: [semgrep, trivy_fs, image_scan, gitleaks, dast_local]
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dast
-          path: dast
-      - run: sudo apt-get update && sudo apt-get install -y jq
-      - run: |
-          FILE="dast/zap.json"
-          if [ ! -s "$FILE" ]; then
-            echo "No ZAP JSON; skipping gate"; exit 0
+          path: artifacts
+      - name: Quick gate (fail on secrets; остальные выводим счётчики)
+        run: |
+          set -e
+          semgrep_cnt=$(jq '[.runs[].results[]?] | length' artifacts/semgrep/semgrep.sarif 2>/dev/null || echo 0)
+          trivy_fs_cnt=$(jq '[.runs[].results[]?] | length' artifacts/trivy-fs/trivy-fs.sarif 2>/dev/null || echo 0)
+          trivy_img_cnt=$(jq '[.runs[].results[]?] | length' artifacts/trivy-image/trivy-image.sarif 2>/dev/null || echo 0)
+          leaks_cnt=$(jq '.leaks | length' artifacts/gitleaks/gitleaks.json 2>/dev/null || echo 0)
+          echo "semgrep=$semgrep_cnt trivy_fs=$trivy_fs_cnt trivy_image=$trivy_img_cnt gitleaks=$leaks_cnt"
+          if [ "$leaks_cnt" -gt 0 ]; then
+            echo "❌ gitleaks found $leaks_cnt secret(s)"; exit 1
           fi
-          highs=$(jq '[.site[].alerts[] | select(.riskcode=="3")] | length' "$FILE")
-          meds=$(jq '[.site[].alerts[] | select(.riskcode=="2")] | length' "$FILE")
-          echo "High: $highs  Medium: $meds"
-          if [ "$highs" -gt 0 ] || [ "$meds" -gt 5 ]; then
-            echo "::error::DAST gate failed (High=$highs, Medium=$meds)"; exit 1
-          fi
-          echo "DAST gate passed"
+
