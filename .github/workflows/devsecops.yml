@@ -103,10 +103,16 @@ jobs:
           if [ -f requirements.txt ]; then
             pip-audit -r requirements.txt -f sarif -o pip-audit.sarif || true
           fi
-          # пустой/отсутствующий файл → кладём минимальный валидный SARIF
           if [ ! -s pip-audit.sarif ]; then
-            printf '%s' \
-'{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"pip-audit"}},"results":[]}]}'> pip-audit.sarif
+            python - <<'PY'
+import json
+payload = {
+  "version":"2.1.0",
+  "$schema":"https://json.schemastore.org/sarif-2.1.0.json",
+  "runs":[{"tool":{"driver":{"name":"pip-audit"}},"results":[]}]
+}
+open("pip-audit.sarif","w").write(json.dumps(payload))
+PY
           fi
       - uses: github/codeql-action/upload-sarif@v3
         with:
@@ -148,39 +154,30 @@ jobs:
     needs: [semgrep, trivy_fs, gitleaks, pip_audit, image_scan]
     steps:
       - uses: actions/checkout@v4
-
       - name: Create network
         run: docker network create net || true
-
       - name: Build app image
         run: docker build -t app:demo .
-
       - name: Stop old app if exists
         run: docker rm -f app || true
-
       - name: Run app container
         run: docker run -d --rm --name app --network net -p 8000:8000 app:demo
-
       - name: Wait readiness (HTTP 200/404 accepted)
         run: |
           for i in $(seq 1 180); do
             if curl -sS -o /dev/null http://127.0.0.1:8000/; then
-              echo "App is up"; exit 0
+              exit 0
             fi
             sleep 1
           done
-          echo "App did not become ready" >&2
-          docker ps -a || true
           docker logs app || true
           exit 1
-
       - name: ZAP baseline -> zap.json & zap.html
         run: |
           mkdir -p zap
           IMG=owasp/zap2docker-stable:latest
           docker run --rm --network net -v "$PWD/zap:/zap/wrk" "$IMG" \
             zap-baseline.py -t http://app:8000/ -J zap.json -w zap.html -T 60 -I || true
-
       - uses: actions/upload-artifact@v4
         with:
           name: zap.json
@@ -189,7 +186,6 @@ jobs:
         with:
           name: zap.html
           path: zap/zap.html
-
       - name: Cleanup
         if: always()
         run: |
@@ -200,8 +196,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [semgrep, trivy_fs, gitleaks, pip_audit, image_scan, dast_local]
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           pattern: "*"
           merge-multiple: true
@@ -217,14 +212,12 @@ jobs:
           GITLEAKS=$(count gitleaks.sarif || echo 0)
           PIP_AUDIT=$(count pip-audit.sarif || echo 0)
           ZAP_TOTAL=$( [ -s zap.json ] && jq -r '[.site[].alerts] | flatten | length' zap.json || echo 0 )
-
           echo "Semgrep: $SEMGREP"
           echo "Trivy FS: $TRIVY_FS"
           echo "Trivy Image: $TRIVY_IMG"
           echo "Gitleaks: $GITLEAKS"
           echo "pip-audit: $PIP_AUDIT"
           echo "ZAP total: $ZAP_TOTAL"
-
           FAIL=0
           if [ "$GITLEAKS" -gt 0 ]; then echo "::error::Gitleaks=$GITLEAKS"; FAIL=1; fi
           if [ "$ZAP_TOTAL" -gt 10 ]; then echo "::warning::ZAP=$ZAP_TOTAL (>10)"; fi
