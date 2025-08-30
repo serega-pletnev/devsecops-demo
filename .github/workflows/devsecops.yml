@@ -157,14 +157,18 @@ jobs:
     needs: image_scan
     steps:
       - uses: actions/checkout@v4
+
       - name: Create net
         run: docker network create net || true
+
       - name: Build image (for DAST)
         run: docker build -t app:demo .
+
       - name: Run app
         run: |
           docker rm -f app || true
           docker run -d --rm --name app --network net -p 8000:8000 app:demo
+
       - name: Wait readiness
         timeout-minutes: 3
         run: |
@@ -173,26 +177,36 @@ jobs:
             sleep 1
           done
           echo "app not ready"; exit 1
-      - name: Pull ZAP
+
+      # === ИСПРАВЛЕНО: авторизуемся в GHCR и тянем ZAP; фоллбек на Docker Hub ===
+      - name: Pull ZAP image (auth GHCR -> fallback Docker Hub)
         run: |
           set -e
-          (docker pull ghcr.io/zaproxy/zap2docker-stable:latest && echo IMG=ghcr.io/zaproxy/zap2docker-stable:latest >> $GITHUB_ENV) || true
-          if ! docker image inspect ghcr.io/zaproxy/zap2docker-stable:latest >/dev/null 2>&1; then
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
+          if docker pull ghcr.io/zaproxy/zap2docker-stable:latest; then
+            echo IMG=ghcr.io/zaproxy/zap2docker-stable:latest >> $GITHUB_ENV
+          else
+            echo "GHCR pull failed, trying Docker Hub..."
+            docker logout ghcr.io || true
             docker pull owasp/zap2docker-stable:latest
             echo IMG=owasp/zap2docker-stable:latest >> $GITHUB_ENV
           fi
+
       - name: ZAP Baseline -> zap.json & zap.html
         run: |
           docker run --rm --network net -v "$PWD:/zap/wrk" "$IMG" \
             zap-baseline.py -t http://app:8000 -J zap.json -w zap.html -T 60 -I || true
+
       - uses: actions/upload-artifact@v4
         with:
           name: zap.json
           path: zap.json
+
       - uses: actions/upload-artifact@v4
         with:
           name: zap.html
           path: zap.html
+
       - name: Cleanup
         if: always()
         run: |
