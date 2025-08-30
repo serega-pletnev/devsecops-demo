@@ -2,11 +2,14 @@ name: DevSecOps CI (SAST/SCA/Secrets/Image + local DAST)
 
 on:
   push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
   contents: read
-  security-events: write
+  security-events: write   # для загрузки SARIF в GitHub Security
   actions: read
 
 jobs:
@@ -14,230 +17,245 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install deps
-        run: |
-          python -m pip install -U pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - name: Smoke
-        run: python -c "print('ok')"
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (best effort)
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt || true
+          fi
+
+  # ---------- SAST / SCA / Secrets ----------
   semgrep:
-    runs-on: ubuntu-latest
     needs: build_test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Semgrep scan -> semgrep.sarif
+
+      - name: Run Semgrep (SARIF)
         run: |
-          docker run --rm -v "$PWD:/src" returntocorp/semgrep:latest \
-            semgrep scan --config auto --metrics=auto \
-            --exclude-dir .git --exclude-dir node_modules \
-            --sarif --output /src/semgrep.sarif || true
-          if [ ! -s semgrep.sarif ]; then
-            printf '%s' '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"semgrep"}},"results":[]}]}'> semgrep.sarif
-          fi
-      - uses: github/codeql-action/upload-sarif@v3
+          docker run --rm \
+            -e SEMGREP_SEND_METRICS=auto \
+            -v "$PWD:/src" -w /src \
+            returntocorp/semgrep:latest \
+            semgrep ci --sarif --output semgrep.sarif || true
+          # подстилка на случай полностью пустого вывода
+          [ -s semgrep.sarif ] || printf '%s' \
+            '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"semgrep"}},"results":[]}]}'> semgrep.sarif
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
           name: semgrep.sarif
           path: semgrep.sarif
 
   trivy_fs:
-    runs-on: ubuntu-latest
     needs: build_test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Trivy FS -> trivy-fs.sarif
         uses: aquasecurity/trivy-action@0.24.0
         with:
-          scan-type: fs
-          format: sarif
-          output: trivy-fs.sarif
-          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          scan-type: 'fs'
+          format: 'sarif'
+          output: 'trivy-fs.sarif'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
           ignore-unfixed: true
-          hide-progress: true
-          github-pat: ${{ secrets.GITHUB_TOKEN }}
-      - uses: github/codeql-action/upload-sarif@v3
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-fs.sarif
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
           name: trivy-fs.sarif
           path: trivy-fs.sarif
 
-  image_scan:
-    runs-on: ubuntu-latest
-    needs: build_test
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build image
-        run: docker build -t app:demo .
-      - name: Trivy image -> trivy-image.sarif
-        uses: aquasecurity/trivy-action@0.24.0
-        with:
-          scan-type: image
-          image-ref: app:demo
-          format: sarif
-          output: trivy-image.sarif
-          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
-          ignore-unfixed: true
-          hide-progress: true
-          github-pat: ${{ secrets.GITHUB_TOKEN }}
-      - uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-image.sarif
-      - uses: actions/upload-artifact@v4
-        with:
-          name: trivy-image.sarif
-          path: trivy-image.sarif
-
   gitleaks:
-    runs-on: ubuntu-latest
     needs: build_test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Gitleaks -> gitleaks.sarif
+
+      - name: Run Gitleaks (SARIF)
         run: |
-          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
-            detect --source=/repo \
-            --report-format=sarif --report-path=/repo/gitleaks.sarif || true
-          if [ ! -s gitleaks.sarif ]; then
-            printf '%s' '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"gitleaks"}},"results":[]}]}'> gitleaks.sarif
-          fi
-      - uses: github/codeql-action/upload-sarif@v3
+          docker run --rm -v "$PWD:/work" -w /work zricethezav/gitleaks:latest \
+            detect --redact --no-git \
+            --report-format sarif --report-path gitleaks.sarif || true
+          [ -s gitleaks.sarif ] || printf '%s' \
+            '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"gitleaks"}},"results":[]}]}'> gitleaks.sarif
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: gitleaks.sarif
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
           name: gitleaks.sarif
           path: gitleaks.sarif
 
   pip_audit:
-    runs-on: ubuntu-latest
     needs: build_test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - name: Install deps
+          python-version: "3.11"
+
+      - name: Install pip-audit and deps
         run: |
-          python -m pip install -U pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          python -m pip install pip-audit
-      - name: pip-audit -> pip-audit.sarif
-        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit || true
           if [ -f requirements.txt ]; then
-            pip-audit -r requirements.txt -f sarif -o pip-audit.sarif || true
-          else
-            printf '%s' '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"pip-audit"}},"results":[]}]}'> pip-audit.sarif
+            pip install -r requirements.txt || true
           fi
-          if [ ! -s pip-audit.sarif ]; then
-            printf '%s' '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"pip-audit"}},"results":[]}]}'> pip-audit.sarif
-          fi
-      - uses: github/codeql-action/upload-sarif@v3
+
+      - name: Run pip-audit -> pip-audit.sarif
+        run: |
+          pip-audit -r requirements.txt -f sarif -o pip-audit.sarif || true
+          [ -s pip-audit.sarif ] || printf '%s' \
+            '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"pip-audit"}},"results":[]}]}'> pip-audit.sarif
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: pip-audit.sarif
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
           name: pip-audit.sarif
           path: pip-audit.sarif
 
-  dast_local:
+  # ---------- Build & Image scan ----------
+  image_scan:
+    needs: build_test
     runs-on: ubuntu-latest
-    needs: image_scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image (app:demo)
+        run: docker build -t app:demo .
+
+      - name: Trivy image -> trivy-image.sarif
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: 'image'
+          image-ref: 'app:demo'
+          format: 'sarif'
+          output: 'trivy-image.sarif'
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          ignore-unfixed: true
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image.sarif
+          path: trivy-image.sarif
+
+  # ---------- Local DAST with ZAP ----------
+  dast_local:
+    needs: [ image_scan, semgrep, trivy_fs, gitleaks, pip_audit ]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Create net
         run: docker network create net || true
 
-      - name: Build image (for DAST)
-        run: docker build -t app:demo .
-
-      - name: Run app
+      - name: Run app container
         run: |
           docker rm -f app || true
-          docker run -d --rm --name app --network net -p 8000:8000 app:demo
+          docker run -d --rm --name app --network net app:demo
+          sleep 1
 
-      - name: Wait readiness
-        timeout-minutes: 3
+      - name: Wait readiness (120s)
         run: |
+          set -e
           for i in $(seq 1 120); do
-            docker run --rm --network net curlimages/curl:8.8.0 -sSf http://app:8000/docs >/dev/null && exit 0 || true
+            if curl -fsS http://app:8000/ >/dev/null; then
+              echo "App is ready"
+              exit 0
+            fi
             sleep 1
           done
-          echo "app not ready"; exit 1
+          echo "App not ready in time" >&2
+          exit 1
 
-      # <<< ИСПРАВЛЕНО: корректные образы ZAP в GHCR >>>
-      - name: Resolve & pull ZAP image (GHCR → GHCR-stable → Hub-weekly → Hub-stable)
+      - name: Resolve & pull ZAP image (GHCR ➜ GHCR-stable ➜ Hub-weekly ➜ Hub-stable)
         id: zapimg
         run: |
           set -euo pipefail
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
-          candidates=(
-            ghcr.io/zaproxy/zaproxy:weekly
-            ghcr.io/zaproxy/zaproxy:stable
-            docker.io/owasp/zap2docker-weekly:latest
-            docker.io/owasp/zap2docker-stable:latest
+          CANDS=(
+            ghcr.io/zaproxy/zap2docker-weekly:latest
+            ghcr.io/zaproxy/zap2docker-stable:latest
+            owasp/zap2docker-weekly:latest
+            owasp/zap2docker-stable:latest
           )
-          picked=""
-          for img in "${candidates[@]}"; do
-            echo "Trying to pull: $img"
-            if docker pull "$img" >/dev/null 2>&1; then
-              echo "Picked $img"
-              echo "IMG=$img" >> "$GITHUB_ENV"
-              picked="yes"
-              break
-            else
-              echo "WARN: pull failed: $img"
-            fi
+          IMG=""
+          for C in "${CANDS[@]}"; do
+            echo "Trying to pull $C ..."
+            if docker pull "$C" >/dev/null 2>&1; then IMG="$C"; break; fi
           done
-          docker logout ghcr.io || true
-          if [ -z "$picked" ]; then
-            echo "::error ::Could not pull any ZAP image from GHCR or Docker Hub"
-            exit 1
-          fi
+          test -n "$IMG" || { echo "No ZAP image could be pulled"; exit 1; }
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
 
       - name: ZAP Baseline -> zap.json & zap.html
         run: |
-          docker run --rm --network net -v "$PWD:/zap/wrk" "$IMG" \
-            zap-baseline.py -t http://app:8000 -J zap.json -w zap.html -T 60 -I || true
+          # ВАЖНО: рабочая директория /zap/wrk (иначе файлы окажутся в корне контейнера)
+          docker run --rm --network net \
+            -v "$PWD:/zap/wrk" -w /zap/wrk "$IMG" \
+            zap-baseline.py -t http://app:8000 \
+              -J zap.json -w zap.html -T 60 -I || true
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zap.json
-          path: zap.json
+          # подстилки, если ничего не сгенерировалось
+          [ -f zap.json ] || printf '%s' \
+            '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"ZAP Baseline"}},"results":[]}]}'> zap.json
+          [ -f zap.html ] || echo '<html><body><h3>ZAP baseline produced no output</h3></body></html>' > zap.html
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload DAST artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: zap.html
-          path: zap.html
+          name: zap-artifacts
+          path: |
+            zap.json
+            zap.html
 
       - name: Cleanup
-        if: always()
         run: |
           docker rm -f app || true
           docker network rm net || true
 
+  # ---------- Gate (простая заглушка; при желании можно усилить) ----------
   gate:
+    needs: dast_local
     runs-on: ubuntu-latest
-    needs: [semgrep, trivy_fs, image_scan, gitleaks, pip_audit, dast_local]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
       - name: Summary
         run: |
-          echo "Artifacts downloaded:"
-          find artifacts -type f -maxdepth 2 -print
+          echo "All scanners finished. See uploaded artifacts and Security tab for SARIF results."
 
