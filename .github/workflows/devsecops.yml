@@ -177,14 +177,15 @@ jobs:
           done
           echo "app not ready"; exit 1
 
+      # <<< ИСПРАВЛЕНО: корректные образы ZAP в GHCR >>>
       - name: Resolve & pull ZAP image (GHCR → GHCR-stable → Hub-weekly → Hub-stable)
         id: zapimg
         run: |
           set -euo pipefail
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
           candidates=(
-            ghcr.io/zaproxy/zap2docker-weekly:latest
-            ghcr.io/zaproxy/zap2docker-stable:latest
+            ghcr.io/zaproxy/zaproxy:weekly
+            ghcr.io/zaproxy/zaproxy:stable
             docker.io/owasp/zap2docker-weekly:latest
             docker.io/owasp/zap2docker-stable:latest
           )
