@@ -97,22 +97,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker network create net || true
-      - run: docker build -t app:demo .
       - run: docker rm -f app || true
+      - run: docker build -t app:demo .
       - run: docker run -d --rm --name app --network net -p 8000:8000 app:demo
       - run: |
           for i in $(seq 1 120); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/ || true)
-            if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then
-              exit 0
-            fi
+            if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then exit 0; fi
             sleep 2
           done
           docker logs app || true
           exit 1
-      - run: echo IMG=ghcr.io/zaproxy/zap2docker-stable:latest >> $GITHUB_ENV
-      - run: docker pull "$IMG" || { docker pull owasp/zap2docker-stable:latest; echo IMG=owasp/zap2docker-stable:latest >> $GITHUB_ENV; }
-      - run: docker run --rm --network net -v "$PWD:/zap/wrk" "$IMG" zap-baseline.py -t http://app:8000/ -J zap.json -w zap.html -T 60 -I
+      - uses: zaproxy/action-baseline@v0.13.0
+        with:
+          target: http://localhost:8000
+          cmd_options: "-J zap.json -w zap.html -T 60 -I"
+          allow_issue_warnings: true
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/upload-artifact@v4
         with:
           name: zap.json
@@ -137,7 +138,5 @@ jobs:
           H=$(jq '[.site[].alerts[] | select((.riskcode=="3") or (.riskdesc|test("High";"i"))) ] | length' zap.json)
           M=$(jq '[.site[].alerts[] | select((.riskcode=="2") or (.riskdesc|test("Medium";"i"))) ] | length' zap.json)
           echo "ZAP High=$H Medium=$M"
-          if [ "$H" -gt 0 ] || [ "$M" -gt 5 ]; then
-            exit 1
-          fi
+          if [ "$H" -gt 0 ] || [ "$M" -gt 5 ]; then exit 1; fi
 
