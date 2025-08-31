@@ -1,0 +1,48 @@
+name: Smoke (Render)
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Public URL (optional, иначе возьмём из секрета/дефолта)'
+        required: false
+        default: ''
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/smoke.yml'
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      DEFAULT_URL: https://devsecops-diplom.onrender.com
+    steps:
+      - name: Resolve target URL
+        id: resolve
+        run: |
+          url="${{ github.event.inputs.url }}"
+          if [ -z "$url" ]; then
+            url="${{ secrets.RENDER_APP_URL }}"
+          fi
+          if [ -z "$url" ]; then
+            url="$DEFAULT_URL"
+          fi
+          echo "URL=$url" >> "$GITHUB_ENV"
+          echo "Using URL=$url"
+
+      - name: Smoke check /healthz
+        run: |
+          set -euo pipefail
+          url="${URL%/}"
+          for i in $(seq 1 12); do
+            code="$(curl -fsS -o /dev/null -w '%{http_code}' "$url/healthz" || true)"
+            if [ "$code" = "200" ]; then
+              echo "Health OK (HTTP $code)"
+              exit 0
+            fi
+            echo "Not ready yet (HTTP $code). Retry $i/12..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          exit 1
