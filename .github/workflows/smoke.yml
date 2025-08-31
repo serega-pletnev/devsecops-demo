@@ -1,43 +1,54 @@
 name: Smoke (Render)
 
 on:
-  workflow_dispatch:
+  pull_request:            # запускаем проверку в каждом PR в main
+    branches: [ main ]
+  push:                    # и после мержа в main
+    branches: [ main ]
+  workflow_dispatch:       # возможность запустить вручную и/или передать URL
     inputs:
       url:
-        description: 'Public URL (optional, иначе возьмём из секрета/дефолта)'
+        description: "Public URL override (optional)"
         required: false
-        default: ''
-  push:
-    branches: [ main ]
-    paths:
-      - '.github/workflows/smoke.yml'
+        default: ""
+
+# чтобы не гонять параллельно несколько одинаковых прогонов
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       DEFAULT_URL: https://devsecops-diplom.onrender.com
     steps:
       - name: Resolve target URL
-        id: resolve
+        shell: bash
         run: |
           url="${{ github.event.inputs.url }}"
-          if [ -z "$url" ]; then
+          if [[ -z "$url" ]]; then
             url="${{ secrets.RENDER_APP_URL }}"
           fi
-          if [ -z "$url" ]; then
+          if [[ -z "$url" ]]; then
             url="$DEFAULT_URL"
           fi
+          # убираем хвостовой слэш, чтобы корректно прибавлять /healthz
+          url="${url%/}"
           echo "URL=$url" >> "$GITHUB_ENV"
           echo "Using URL=$url"
 
       - name: Smoke check /healthz
+        shell: bash
         run: |
           set -euo pipefail
-          url="${URL%/}"
-          for i in $(seq 1 12); do
-            code="$(curl -fsS -o /dev/null -w '%{http_code}' "$url/healthz" || true)"
-            if [ "$code" = "200" ]; then
+          for i in {1..12}; do
+            code="$(curl -fsS -o /dev/null -w '%{http_code}' "$URL/healthz" || true)"
+            if [[ "$code" == "200" ]]; then
               echo "Health OK (HTTP $code)"
               exit 0
             fi
